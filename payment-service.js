@@ -119,10 +119,10 @@ const PaymentService = (() => {
       Store.update('invoices', invoice.id, { status: 'paid', paidAt: new Date().toISOString() });
       EventBus.emit('payment:success', { invoiceId: invoice.id, transactionId });
       EventBus.emit('data:changed');
-      Notifications.add(`✅ [SANDBOX] Оплата інвойсу #${invoice.number} підтверджена. Транзакція: ${transactionId}`, 'telegram');
+      Notifications.add(`✅ Оплата інвойсу #${invoice.number} підтверджена. Транзакція: ${transactionId}`, 'telegram');
     } else {
       EventBus.emit('payment:failed', { invoiceId: invoice.id, transactionId });
-      Notifications.add(`❌ [SANDBOX] Оплата інвойсу #${invoice.number} не вдалась. Спробуйте ще раз.`, 'email');
+      Notifications.add(`❌ Оплата інвойсу #${invoice.number} не вдалась. Спробуйте ще раз.`, 'email');
     }
 
     return {
@@ -131,8 +131,8 @@ const PaymentService = (() => {
       status,
       sandbox: true,
       message: success
-        ? `[SANDBOX] Платіж успішний. Транзакція: ${transactionId}`
-        : '[SANDBOX] Платіж відхилено (симуляція невдачі)',
+        ? `Платіж успішний. Транзакція: ${transactionId}`
+        : 'Платіж відхилено. Спробуйте ще раз.',
     };
   }
 

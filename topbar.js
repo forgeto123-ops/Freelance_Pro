@@ -189,6 +189,12 @@ const Topbar = (() => {
             <p class="text-sm text-amber-500 dark:text-amber-500 mt-1">👑 Королики на балансі</p>
           </div>
 
+          <!-- Top-up button -->
+          <button id="koroliky-topup-btn"
+            class="btn-primary w-full justify-center bg-green-600 hover:bg-green-700">
+            💳 Поповнити Королики
+          </button>
+
           <!-- Daily bonus status -->
           <div class="p-3 rounded-xl ${status.canClaim ? 'bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800' : 'bg-gray-50 dark:bg-gray-700/50'}">
             <div class="flex items-center justify-between">
@@ -241,6 +247,11 @@ const Topbar = (() => {
           ` : ''}
         </div>
       `,
+    });
+
+    // Top-up
+    document.getElementById('koroliky-topup-btn')?.addEventListener('click', () => {
+      KorolikyService.topUpBalance();
     });
 
     // Claim bonus
