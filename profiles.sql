@@ -54,3 +54,10 @@ $$;
 create or replace trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
+
+-- ============================================================
+-- 7. Колонка telegram_chat_id (запустіть окремо, якщо таблиця
+--    вже існує та міграція потрібна без перестворення)
+-- ============================================================
+alter table public.profiles
+  add column if not exists telegram_chat_id text;

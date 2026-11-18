@@ -1,641 +1,523 @@
 /**
- * AuthService — повна система автентифікації
+ * AuthPage — Сторінка реєстрації / входу / верифікації email
  *
- * Режими роботи:
- *  A) SUPABASE AUTH (рекомендовано) — якщо в налаштуваннях вказано Supabase URL + Key,
- *     всі операції делегуються supabase.auth.*  Supabase сам надсилає OTP на email
- *     зі своїх серверів (безкоштовно, без власного SMTP).
- *
- *  B) SANDBOX (локально) — якщо Supabase не підключено, OTP зберігається в
- *     localStorage і відображається у тості та консолі (тільки для розробки).
- *
- * Налаштування Supabase Auth (одноразово):
- *  1. supabase.com → Authentication → Providers → Email — увімкнути "Confirm email"
- *  2. Authentication → Email Templates — можна кастомізувати лист
- *  3. Authentication → URL Configuration → Site URL = URL вашого застосунку
- *  4. Вставте Project URL + anon key у Налаштування → Supabase в застосунку
- *
- * Решта логіки (хешування паролів, Koroliky, сесія) — без змін.
+ * Режими: 'login' | 'register' | 'verify'
+ * Якщо користувач не авторизований — показується ця сторінка замість основного UI.
  */
-const AuthService = (() => {
+const AuthPage = (() => {
 
-  const USERS_KEY     = 'saas_users';
-  const SESSION_KEY   = 'saas_session';
-  const OTP_KEY       = 'saas_otp_pending';
+  let _mode = 'login';          // 'login' | 'register' | 'verify'
+  let _pendingEmail = '';       // email очікує верифікації
+  let _otpTimerInterval = null; // ID таймера для відліку OTP
+  let _resendTimerInterval = null;
 
-  // EmailJS config
-  const EMAILJS_SERVICE_ID = 'service_nbyuig6';
-  const EMAILJS_TEMPLATE_ID = 'template_rvowgat';
+  // ─── Монтування / демонтування ───────────────────────────────────────────
 
-  // Pending registration data (email, password, displayName, code)
-  let _pendingRegistration = null;
-
-  // Initialize EmailJS with Public Key
-  if (typeof emailjs !== 'undefined') {
-    emailjs.init('dWvgK6UO2kZx0RUxE');
+  function mount(mode = 'login', pendingEmail = '') {
+    _mode = mode;
+    _pendingEmail = pendingEmail;
+    _render();
   }
 
-  // Одноразові поштові домени (базовий список)
-  const DISPOSABLE_DOMAINS = new Set([
-    'mailinator.com','guerrillamail.com','tempmail.com','throwaway.email',
-    'yopmail.com','sharklasers.com','guerrillamailblock.com','grr.la',
-    'guerrillamail.info','guerrillamail.biz','guerrillamail.de','guerrillamail.net',
-    'guerrillamail.org','spam4.me','trashmail.com','trashmail.me','trashmail.net',
-    'dispostable.com','mailnull.com','spamgourmet.com','getairmail.com',
-    'filzmail.com','throwam.com','maildrop.cc','discard.email','fakeinbox.com',
-    'mailnesia.com','spamex.com','temp-mail.org','tempr.email','10minutemail.com',
-    'tempinbox.com','mailtemp.info','mt2015.com','spamfree24.org','bugmenot.com',
-  ]);
+  function unmount() {
+    _clearTimers();
+    // Відновлюємо основний UI
+    document.getElementById('app-shell').classList.remove('hidden');
+    document.getElementById('auth-overlay').classList.add('hidden');
+  }
 
-  // ─── Визначення режиму ────────────────────────────────────────────────────
+  // ─── Відображення ────────────────────────────────────────────────────────
 
-  /**
-   * Повертає Supabase client якщо він підключений і підтримує Auth.
-   * @returns {object|null}
-   */
-  function _getSupabaseClient() {
-    if (typeof SupabaseService !== 'undefined' && SupabaseService.isConnected()) {
-      return SupabaseService.getClient();
+  function _render() {
+    let overlay = document.getElementById('auth-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'auth-overlay';
+      overlay.className = 'fixed inset-0 z-[9999] bg-gray-50 dark:bg-gray-900 flex items-center justify-center p-4';
+      document.body.appendChild(overlay);
     }
-    return null;
+    overlay.classList.remove('hidden');
+    document.getElementById('app-shell')?.classList.add('hidden');
+
+    overlay.innerHTML = `
+      <div class="w-full max-w-md">
+        <!-- Logo -->
+        <div class="text-center mb-8">
+          <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center mx-auto mb-3 shadow-lg">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+            </svg>
+          </div>
+          <h1 class="text-2xl font-bold text-gray-800 dark:text-gray-100">FreelanceHub Pro</h1>
+          <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Smart Invoice & CRM Suite</p>
+        </div>
+
+        <!-- Card -->
+        <div class="card shadow-xl border border-gray-200 dark:border-gray-700">
+          <div id="auth-form-container">
+            ${_mode === 'verify' ? _renderVerifyForm() : (_mode === 'register' ? _renderRegisterForm() : _renderLoginForm())}
+          </div>
+        </div>
+
+        <!-- Footer -->
+        <p class="text-center text-xs text-gray-400 dark:text-gray-600 mt-6">
+          FreelanceHub Pro v1.1 · Дані зберігаються локально
+        </p>
+      </div>
+    `;
+
+    _bindEvents();
   }
 
-  function _isSupabaseMode() {
-    return _getSupabaseClient() !== null;
+  function _renderLoginForm() {
+    return `
+      <h2 class="text-lg font-bold text-gray-800 dark:text-gray-100 mb-5">Вхід до системи</h2>
+      <form id="auth-form" class="space-y-4" novalidate>
+        <div>
+          <label class="label">Email</label>
+          <input name="email" type="email" class="input" placeholder="your@email.com" autocomplete="email" required />
+          <p id="err-email" class="text-xs text-red-500 mt-1 hidden"></p>
+        </div>
+        <div>
+          <label class="label">Пароль</label>
+          <div class="relative">
+            <input name="password" type="password" class="input pr-10" placeholder="••••••••" autocomplete="current-password" required />
+            <button type="button" id="toggle-pwd" class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+              <svg id="eye-icon" xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            </button>
+          </div>
+          <p id="err-password" class="text-xs text-red-500 mt-1 hidden"></p>
+        </div>
+        <p id="auth-global-err" class="text-sm text-red-500 hidden"></p>
+        <button type="submit" id="auth-submit-btn" class="btn-primary w-full justify-center">Увійти</button>
+      </form>
+      <div class="mt-5 pt-4 border-t border-gray-100 dark:border-gray-700 text-center">
+        <p class="text-sm text-gray-500 dark:text-gray-400">
+          Немає акаунту?
+          <button id="switch-to-register" class="text-indigo-600 dark:text-indigo-400 font-semibold hover:underline ml-1">Зареєструватись</button>
+        </p>
+      </div>
+    `;
   }
 
-  // ─── Утиліти хешування (Web Crypto API, для sandbox-режиму) ─────────────
-
-  async function _hashPassword(password, salt = null) {
-    const enc = new TextEncoder();
-    if (!salt) {
-      const arr = crypto.getRandomValues(new Uint8Array(16));
-      salt = Array.from(arr).map(b => b.toString(16).padStart(2,'0')).join('');
-    }
-    const keyMaterial = await crypto.subtle.importKey(
-      'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
-    );
-    const bits = await crypto.subtle.deriveBits(
-      { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
-      keyMaterial, 256
-    );
-    const hash = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2,'0')).join('');
-    return { hash, salt };
+  function _renderRegisterForm() {
+    return `
+      <h2 class="text-lg font-bold text-gray-800 dark:text-gray-100 mb-5">Створити акаунт</h2>
+      <form id="auth-form" class="space-y-4" novalidate>
+        <div>
+          <label class="label">Ім'я (для шаблонів)</label>
+          <input name="displayName" type="text" class="input" placeholder="Іван Петренко" autocomplete="name" />
+        </div>
+        <div>
+          <label class="label">Email *</label>
+          <input name="email" type="email" class="input" placeholder="your@email.com" autocomplete="email" required />
+          <p id="err-email" class="text-xs text-red-500 mt-1 hidden"></p>
+        </div>
+        <div>
+          <label class="label">Пароль *</label>
+          <div class="relative">
+            <input name="password" type="password" class="input pr-10" placeholder="Мінімум 8 символів, 1 велика, 1 цифра" autocomplete="new-password" required />
+            <button type="button" id="toggle-pwd" class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+              <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            </button>
+          </div>
+          <p id="err-password" class="text-xs text-red-500 mt-1 hidden"></p>
+        </div>
+        <div>
+          <label class="label">Повторіть пароль *</label>
+          <input name="passwordConfirm" type="password" class="input" placeholder="••••••••" autocomplete="new-password" required />
+          <p id="err-passwordConfirm" class="text-xs text-red-500 mt-1 hidden"></p>
+        </div>
+        <div>
+          <label class="flex items-start gap-2.5 cursor-pointer p-3 rounded-xl border-2 border-gray-200 dark:border-gray-600 hover:border-indigo-300 transition-all">
+            <input type="checkbox" id="consent-cb" class="w-4 h-4 rounded accent-indigo-600 mt-0.5 shrink-0" />
+            <span class="text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+              Я погоджуюсь з <a href="privacy.html" target="_blank" rel="noopener" class="text-indigo-600 dark:text-indigo-400 underline font-semibold">Політикою конфіденційності</a> та <a href="#legal" data-route="legal" class="text-indigo-600 dark:text-indigo-400 underline font-semibold">Умовами використання</a>. Мої дані будуть оброблятися відповідно до GDPR.
+            </span>
+          </label>
+          <p id="err-consent" class="text-xs text-red-500 mt-1 hidden">Потрібна ваша згода для реєстрації</p>
+        </div>
+        <p id="auth-global-err" class="text-sm text-red-500 hidden"></p>
+        <button type="submit" id="auth-submit-btn" class="btn-primary w-full justify-center">Зареєструватись</button>
+      </form>
+      <div class="mt-5 pt-4 border-t border-gray-100 dark:border-gray-700 text-center">
+        <p class="text-sm text-gray-500 dark:text-gray-400">
+          Вже є акаунт?
+          <button id="switch-to-login" class="text-indigo-600 dark:text-indigo-400 font-semibold hover:underline ml-1">Увійти</button>
+        </p>
+      </div>
+    `;
   }
 
-  async function _verifyPassword(password, storedHash, storedSalt) {
-    const { hash } = await _hashPassword(password, storedSalt);
-    return hash === storedHash;
+  function _renderVerifyForm() {
+    const otpStatus = AuthService.getOTPStatus(_pendingEmail);
+    const isSandbox = otpStatus.sandbox;
+
+    return `
+      <div class="text-center mb-5">
+        <div class="text-5xl mb-3">📧</div>
+        <h2 class="text-lg font-bold text-gray-800 dark:text-gray-100">Підтвердіть email</h2>
+        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+          Ми надіслали 5-значний код на вашу пошту<br/>
+          <span class="font-semibold text-gray-700 dark:text-gray-300">${_pendingEmail}</span>
+        </p>
+        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Введіть його нижче:</p>
+        ${isSandbox ? `
+          <div class="mt-3 p-2 bg-amber-50 dark:bg-amber-900/20 rounded-xl border border-amber-200 dark:border-amber-800">
+            <p class="text-xs text-amber-700 dark:text-amber-400 font-semibold">🧪 SANDBOX: код відображається в консолі браузера (F12 → Console)</p>
+          </div>
+        ` : ''}
+      </div>
+      <form id="auth-form" class="space-y-4" novalidate>
+        <div>
+          <label class="label">Код підтвердження з email</label>
+          <input name="otp" type="text" inputmode="numeric" maxlength="5"
+            class="input text-center text-2xl font-bold font-mono tracking-[0.5em] letter-spacing-widest"
+            placeholder="_ _ _ _ _"
+            autocomplete="one-time-code"
+            required />
+          <div class="flex items-center justify-between mt-1.5">
+            <span id="otp-expires" class="text-xs text-gray-400"></span>
+            <button type="button" id="resend-otp-btn" class="text-xs text-indigo-600 dark:text-indigo-400 hover:underline disabled:opacity-40 disabled:no-underline" disabled>
+              Надіслати код повторно (<span id="resend-countdown">60</span>с)
+            </button>
+          </div>
+          <p id="err-otp" class="text-xs text-red-500 mt-1 hidden"></p>
+        </div>
+        <p id="auth-global-err" class="text-sm text-red-500 hidden"></p>
+        <button type="submit" id="auth-submit-btn" class="btn-primary w-full justify-center">Підтвердити код</button>
+      </form>
+      <div class="mt-4 text-center">
+        <button id="back-to-login" class="text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">← Назад до входу</button>
+      </div>
+    `;
   }
 
-  function _generateOTP() {
-    return String(Math.floor(10000 + Math.random() * 90000));
+  function _renderEmailSentMessage() {
+    return `
+      <div class="text-center py-6">
+        <div class="text-5xl mb-3">📧</div>
+        <h2 class="text-lg font-bold text-gray-800 dark:text-gray-100">Перевірте пошту</h2>
+        <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">
+          Ми надіслали лист для підтвердження на<br/>
+          <span class="font-semibold text-gray-700 dark:text-gray-300">${_pendingEmail}</span>
+        </p>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mt-3 font-medium">
+          Перевірте пошту та перейдіть за посиланням у листі для підтвердження акаунту.
+        </p>
+        <p class="text-xs text-gray-400 dark:text-gray-500 mt-3">
+          Після підтвердження ви зможете увійти у систему.
+        </p>
+      </div>
+      <div class="mt-4 text-center">
+        <button id="back-to-login" class="text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">← Назад до входу</button>
+      </div>
+    `;
   }
 
-  // ─── Валідація email ─────────────────────────────────────────────────────
+  // ─── Прив'язка подій ──────────────────────────────────────────────────────
 
-  function validateEmail(email) {
-    if (!email) return { valid: false, error: 'Email не може бути порожнім' };
-    const trimmed = email.trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(trimmed)) {
-      return { valid: false, error: 'Невірний формат email' };
-    }
-    const domain = trimmed.split('@')[1];
-    if (DISPOSABLE_DOMAINS.has(domain)) {
-      return { valid: false, error: `Одноразова пошта (${domain}) не допускається. Використайте реальну адресу.` };
-    }
-    return { valid: true, email: trimmed };
-  }
-
-  // ─── Зберігання користувачів (sandbox) ───────────────────────────────────
-
-  function _getUsers() {
-    try { return JSON.parse(localStorage.getItem(USERS_KEY) || '[]'); }
-    catch { return []; }
-  }
-
-  function _saveUsers(users) {
-    localStorage.setItem(USERS_KEY, JSON.stringify(users));
-  }
-
-  function _findUserByEmail(email) {
-    return _getUsers().find(u => u.email === email.toLowerCase()) || null;
-  }
-
-  // ════════════════════════════════════════════════════════════════════════
-  // РЕЄСТРАЦІЯ
-  // ════════════════════════════════════════════════════════════════════════
-
-  async function register(email, password, displayName = '') {
-    const emailCheck = validateEmail(email);
-    if (!emailCheck.valid) return { success: false, error: emailCheck.error };
-
-    if (password.length < 8) return { success: false, error: 'Пароль має містити щонайменше 8 символів' };
-    if (!/[A-Z]/.test(password)) return { success: false, error: 'Пароль має містити щонайменше одну велику літеру' };
-    if (!/[0-9]/.test(password)) return { success: false, error: 'Пароль має містити щонайменше одну цифру' };
-
-    // ── РЕЖИМ A: Supabase Auth ─────────────────────────────────────────
-    if (_isSupabaseMode()) {
-      return await _supabaseRegister(emailCheck.email, password, displayName);
-    }
-
-    // ── РЕЖИМ B: Sandbox (localStorage) ───────────────────────────────
-    return await _sandboxRegister(emailCheck.email, password, displayName);
-  }
-
-  // ════════════════════════════════════════════════════════════════════════
-  // РЕЄСТРАЦІЯ З ПІДТВЕРДЖЕННЯМ ПОШТИ ЧЕРЕЗ EMAILJS
-  // ════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Крок 1: Валідація, генерація 5-значного коду, відправка через EmailJS.
-   * Дані форми зберігаються в пам'яті до підтвердження коду.
-   */
-  async function startRegistration(email, password, displayName = '') {
-    const emailCheck = validateEmail(email);
-    if (!emailCheck.valid) return { success: false, error: emailCheck.error };
-
-    if (password.length < 8) return { success: false, error: 'Пароль має містити щонайменше 8 символів' };
-    if (!/[A-Z]/.test(password)) return { success: false, error: 'Пароль має містити щонайменше одну велику літеру' };
-    if (!/[0-9]/.test(password)) return { success: false, error: 'Пароль має містити щонайменше одну цифру' };
-
-    // Перевірка чи email вже не зареєстрований локально
-    const existingLocal = _findUserByEmail(emailCheck.email);
-    if (existingLocal && existingLocal.status === 'active') {
-      return { success: false, error: 'Користувач з таким email вже зареєстрований. Увійдіть у свій акаунт.', alreadyRegistered: true };
-    }
-
-    // Генеруємо 5-значний числовий код
-    const code = String(Math.floor(10000 + Math.random() * 90000));
-
-    // Зберігаємо дані форми + код у пам'яті
-    _pendingRegistration = { email: emailCheck.email, password, displayName: displayName.trim(), code };
-
-    // Відправляємо код через EmailJS
-    try {
-      await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-        to_email: emailCheck.email,
-        code,
-      });
-    } catch (e) {
-      _pendingRegistration = null;
-      return { success: false, error: 'Не вдалося надіслати код. Спробуйте ще раз.' };
-    }
-
-    return { success: true, email: emailCheck.email };
-  }
-
-  /**
-   * Крок 2: Перевірка коду. Якщо вірний — створює акаунт у Supabase
-   * (Confirm email вимкнено → акаунт створюється миттєво з сесією).
-   */
-  async function verifyCodeAndRegister(enteredCode) {
-    if (!_pendingRegistration) {
-      return { success: false, error: 'Дані реєстрації не знайдені. Почніть спочатку.' };
-    }
-
-    if (String(enteredCode).trim() !== _pendingRegistration.code) {
-      return { success: false, error: 'Невірний 5-значний код, перевірте пошту та спробуйте ще раз' };
-    }
-
-    // Код вірний — створюємо акаунт
-    const { email, password, displayName } = _pendingRegistration;
-    _pendingRegistration = null;
-
-    return await register(email, password, displayName);
-  }
-
-  /**
-   * Повторне відправлення коду через EmailJS (з новим кодом).
-   */
-  async function resendRegistrationCode() {
-    if (!_pendingRegistration) {
-      return { success: false, error: 'Дані реєстрації не знайдені.' };
-    }
-
-    // Генеруємо новий код
-    const newCode = String(Math.floor(10000 + Math.random() * 90000));
-    _pendingRegistration.code = newCode;
-
-    try {
-      await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-        to_email: _pendingRegistration.email,
-        code: newCode,
-      });
-      return { success: true };
-    } catch (e) {
-      return { success: false, error: 'Не вдалося надіслати код.' };
-    }
-  }
-
-  // ── Supabase реєстрація ───────────────────────────────────────────────────
-
-  async function _supabaseRegister(email, password, displayName) {
-    const sb = _getSupabaseClient();
-    try {
-      const { data, error } = await sb.auth.signUp({
-        email,
-        password,
-        options: {
-          data: {
-            full_name: displayName || email.split('@')[0],
-          },
-        },
-      });
-
-      if (error) {
-        // Supabase повертає помилку якщо email вже зареєстровано
-        if (error.message?.includes('already registered') || error.message?.includes('already been registered')) {
-          return { success: false, error: 'Користувач з таким email вже зареєстрований. Увійдіть у свій акаунт.', alreadyRegistered: true };
-        }
-        return { success: false, error: error.message };
-      }
-
-      // Supabase повертає user=null з порожнім identities, коли email вже зареєстрований
-      // (при увімкненому Confirm email)
-      if (!data.user && Array.isArray(data.identities) && data.identities.length === 0) {
-        return { success: false, error: 'Користувач з таким email вже зареєстрований. Увійдіть у свій акаунт.', alreadyRegistered: true };
-      }
-
-      // Confirm email вимкнено — акаунт створюється миттєво з сесією
-      const sbUser = data.user;
-      const userId = sbUser?.id;
-      const displayNameFinal = sbUser?.user_metadata?.full_name || sbUser?.user_metadata?.display_name || displayName || email.split('@')[0];
-
-      await _ensureLocalProfile(email, displayNameFinal, userId);
-      await _activateLocalProfile(email, userId);
-
-      // Починаємо локальну сесію (signUp з Confirm email OFF повертає сесію)
-      const localUser = _findUserByEmail(email);
-      _startSession(localUser || { id: userId, email, displayName: displayNameFinal });
-
-      // Синхронізуємо баланс Короликів з таблицею profiles у Supabase
-      if (typeof KorolikyService !== 'undefined' && KorolikyService.syncFromSupabase) {
-        await KorolikyService.syncFromSupabase();
-      }
-
-      return { success: true, userId, user: _publicUser(localUser || { id: userId, email, displayName: displayNameFinal, status: 'active', koroliky: 0 }) };
-
-    } catch (e) {
-      return { success: false, error: e.message };
-    }
-  }
-
-  // ── Sandbox реєстрація ────────────────────────────────────────────────────
-
-  async function _sandboxRegister(email, password, displayName) {
-    const existing = _findUserByEmail(email);
-    if (existing) return { success: false, error: 'Користувач з таким email вже існує' };
-
-    const { hash, salt } = await _hashPassword(password);
-    const id = `usr_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
-
-    const user = {
-      id, email,
-      displayName: displayName.trim() || email.split('@')[0],
-      passwordHash: hash, passwordSalt: salt,
-      status: 'unverified',
-      koroliky: 0, lastBonusClaimedAt: null,
-      createdAt: new Date().toISOString(),
-    };
-
-    const users = _getUsers();
-    users.push(user);
-    _saveUsers(users);
-
-    const otpResult = await _sandboxSendOTP(email, id);
-    return { success: true, userId: id, otpSent: otpResult.sent, sandbox: true };
-  }
-
-  // ════════════════════════════════════════════════════════════════════════
-  // OTP / ПІДТВЕРДЖЕННЯ EMAIL
-  // ════════════════════════════════════════════════════════════════════════
-
-  async function resendOTP(email) {
-    // ── РЕЖИМ A: Supabase ──────────────────────────────────────────────
-    if (_isSupabaseMode()) {
-      return await _supabaseResendOTP(email);
-    }
-
-    // ── РЕЖИМ B: Sandbox ───────────────────────────────────────────────
-    const key = OTP_KEY + '_' + email;
-    const existing = JSON.parse(localStorage.getItem(key) || 'null');
-    if (existing) {
-      const secondsSinceSent = (Date.now() - existing.sentAt) / 1000;
-      if (secondsSinceSent < 60) {
-        return { success: false, error: `Зачекайте ще ${Math.ceil(60 - secondsSinceSent)} сек перед повторною відправкою` };
-      }
-    }
-    const user = _findUserByEmail(email);
-    if (!user) return { success: false, error: 'Користувач не знайдений' };
-    const result = await _sandboxSendOTP(email, user.id);
-    return { success: true, sandbox: result.sandbox };
-  }
-
-  async function _supabaseResendOTP(email) {
-    const sb = _getSupabaseClient();
-    try {
-      // Supabase: повторно надсилає лист підтвердження
-      const { error } = await sb.auth.resend({ type: 'signup', email });
-      if (error) return { success: false, error: error.message };
-      return { success: true, sandbox: false };
-    } catch (e) {
-      return { success: false, error: e.message };
-    }
-  }
-
-  async function verifyOTP(email, enteredCode) {
-    // ── РЕЖИМ A: Supabase ──────────────────────────────────────────────
-    if (_isSupabaseMode()) {
-      return await _supabaseVerifyOTP(email, enteredCode);
-    }
-
-    // ── РЕЖИМ B: Sandbox ───────────────────────────────────────────────
-    return await _sandboxVerifyOTP(email, enteredCode);
-  }
-
-  async function _supabaseVerifyOTP(email, token) {
-    const sb = _getSupabaseClient();
-    try {
-      const { data, error } = await sb.auth.verifyOtp({
-        email,
-        token: String(token).trim(),
-        type: 'signup',
-      });
-
-      if (error) {
-        return { success: false, error: 'Невірний код, спробуйте ще раз' };
-      }
-
-      const sbUser = data.user;
-      const userId = sbUser?.id;
-      const displayName = sbUser?.user_metadata?.full_name || sbUser?.user_metadata?.display_name || email.split('@')[0];
-
-      await _activateLocalProfile(email, userId);
-
-      // Починаємо локальну сесію — verifyOtp вже створив сесію у Supabase
-      const localUser = _findUserByEmail(email);
-      _startSession(localUser || { id: userId, email, displayName });
-
-      // Синхронізуємо баланс Короликів з таблицею profiles у Supabase
-      if (typeof KorolikyService !== 'undefined' && KorolikyService.syncFromSupabase) {
-        await KorolikyService.syncFromSupabase();
-      }
-
-      return { success: true, userId, user: _publicUser(localUser || { id: userId, email, displayName, status: 'active', koroliky: 0 }) };
-
-    } catch (e) {
-      return { success: false, error: 'Невірний код, спробуйте ще раз' };
-    }
-  }
-
-  async function _sandboxVerifyOTP(email, enteredCode) {
-    const key = OTP_KEY + '_' + email;
-    const data = JSON.parse(localStorage.getItem(key) || 'null');
-
-    if (!data) return { success: false, error: 'Код верифікації не знайдений. Запросіть новий.' };
-    if (Date.now() > data.expiresAt) {
-      localStorage.removeItem(key);
-      return { success: false, error: 'Код верифікації застарів (10 хвилин). Запросіть новий.' };
-    }
-    if (data.attempts >= 5) {
-      localStorage.removeItem(key);
-      return { success: false, error: 'Забагато невірних спроб. Запросіть новий код.' };
-    }
-    if (String(enteredCode).trim() !== data.otp) {
-      data.attempts++;
-      localStorage.setItem(key, JSON.stringify(data));
-      return { success: false, error: `Невірний код. Залишилось спроб: ${5 - data.attempts}` };
-    }
-
-    localStorage.removeItem(key);
-    await _activateLocalProfile(email, data.userId);
-    return { success: true, userId: data.userId };
-  }
-
-  // ── Sandbox OTP відправка ─────────────────────────────────────────────────
-
-  async function _sandboxSendOTP(email, userId) {
-    const otp = _generateOTP();
-    const expiresAt = Date.now() + 10 * 60 * 1000;
-    const sentAt = Date.now();
-    localStorage.setItem(OTP_KEY + '_' + email, JSON.stringify({ email, userId, otp, expiresAt, sentAt, attempts: 0 }));
-    console.log(`[AuthService Sandbox] OTP для ${email}: ${otp}`);
-    EventBus.emit('auth:otp_sandbox', { email, otp });
-    return { sent: true, sandbox: true };
-  }
-
-  // ── Локальний профіль (Koroliky, displayName) ─────────────────────────────
-
-  async function _ensureLocalProfile(email, displayName, supabaseUserId) {
-    const existing = _findUserByEmail(email);
-    if (existing) return;
-    const users = _getUsers();
-    users.push({
-      id: supabaseUserId || `usr_${Date.now()}`,
-      email,
-      displayName: displayName || email.split('@')[0],
-      status: 'unverified',
-      koroliky: 0, lastBonusClaimedAt: null,
-      createdAt: new Date().toISOString(),
+  function _bindEvents() {
+    // Перемикання пароль / текст
+    document.getElementById('toggle-pwd')?.addEventListener('click', () => {
+      const pwd = document.querySelector('input[name="password"]');
+      if (pwd) pwd.type = pwd.type === 'password' ? 'text' : 'password';
     });
-    _saveUsers(users);
-  }
 
-  async function _activateLocalProfile(email, supabaseUserId) {
-    const users = _getUsers();
-    const idx = users.findIndex(u => u.email === email);
-    if (idx !== -1) {
-      users[idx].status = 'active';
-      users[idx].verifiedAt = new Date().toISOString();
-      if (!users[idx].koroliky) {
-        users[idx].koroliky = 500; // Бонус за реєстрацію
-        users[idx].lastBonusClaimedAt = new Date().toISOString();
+    // Перемикач режимів
+    document.getElementById('switch-to-register')?.addEventListener('click', () => {
+      _mode = 'register';
+      document.getElementById('auth-form-container').innerHTML = _renderRegisterForm();
+      _bindEvents();
+    });
+    document.getElementById('switch-to-login')?.addEventListener('click', () => {
+      _mode = 'login';
+      document.getElementById('auth-form-container').innerHTML = _renderLoginForm();
+      _bindEvents();
+    });
+    document.getElementById('back-to-login')?.addEventListener('click', () => {
+      _mode = 'login';
+      _clearTimers();
+      document.getElementById('auth-form-container').innerHTML = _renderLoginForm();
+      _bindEvents();
+    });
+
+    // Submit форми
+    document.getElementById('auth-form')?.addEventListener('submit', async e => {
+      e.preventDefault();
+      await _handleSubmit(e.target);
+    });
+
+    // Resend OTP
+    document.getElementById('resend-otp-btn')?.addEventListener('click', async () => {
+      const result = await AuthService.resendRegistrationCode();
+      if (result.success) {
+        _startOTPTimers();
+        const errEl = document.getElementById('err-otp');
+        if (errEl) { errEl.textContent = '✅ Новий код відправлено'; errEl.classList.remove('hidden', 'text-red-500'); errEl.classList.add('text-green-600'); }
+      } else {
+        const errEl = document.getElementById('err-otp');
+        if (errEl) { errEl.textContent = result.error; errEl.classList.remove('hidden'); }
       }
-      if (supabaseUserId) users[idx].id = supabaseUserId;
-      _saveUsers(users);
-    } else {
-      // Профіль ще не створено (наприклад, перший вхід після підтвердження на іншому пристрої)
-      const users2 = _getUsers();
-      users2.push({
-        id: supabaseUserId || `usr_${Date.now()}`,
-        email, displayName: email.split('@')[0],
-        status: 'active', verifiedAt: new Date().toISOString(),
-        koroliky: 500, lastBonusClaimedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-      });
-      _saveUsers(users2);
+    });
+
+    // Старт OTP таймерів якщо в режимі verify
+    if (_mode === 'verify') {
+      _startOTPTimers();
     }
   }
 
-  // ════════════════════════════════════════════════════════════════════════
-  // ВХІД
-  // ════════════════════════════════════════════════════════════════════════
+  async function _handleSubmit(form) {
+    const btn = document.getElementById('auth-submit-btn');
+    const globalErr = document.getElementById('auth-global-err');
 
-  async function login(email, password) {
-    const emailCheck = validateEmail(email);
-    if (!emailCheck.valid) return { success: false, error: emailCheck.error };
+    // Скидаємо помилки
+    form.querySelectorAll('[id^="err-"]').forEach(el => el.classList.add('hidden'));
+    globalErr.classList.add('hidden');
+    btn.disabled = true;
+    btn.textContent = '⏳ Зачекайте...';
 
-    // ── РЕЖИМ A: Supabase ──────────────────────────────────────────────
-    if (_isSupabaseMode()) {
-      return await _supabaseLogin(emailCheck.email, password);
-    }
-
-    // ── РЕЖИМ B: Sandbox ───────────────────────────────────────────────
-    return await _sandboxLogin(emailCheck.email, password);
-  }
-
-  async function _supabaseLogin(email, password) {
-    const sb = _getSupabaseClient();
     try {
-      const { data, error } = await sb.auth.signInWithPassword({ email, password });
+      if (_mode === 'login') {
+        await _doLogin(form);
+      } else if (_mode === 'register') {
+        await _doRegister(form);
+      } else if (_mode === 'verify') {
+        await _doVerify(form);
+      }
+    } finally {
+      btn.disabled = false;
+      btn.textContent = _mode === 'login' ? 'Увійти' : _mode === 'register' ? 'Зареєструватись' : 'Підтвердити код';
+    }
+  }
 
-      if (error) {
-        if (error.message?.includes('Email not confirmed')) {
-          return { success: false, needVerification: true, email, error: 'Підтвердіть email перед входом' };
+  async function _doLogin(form) {
+    const email = form.email?.value?.trim() || '';
+    const password = form.password?.value || '';
+    const globalErr = document.getElementById('auth-global-err');
+
+    if (!email) { _showFieldErr('email', 'Введіть email'); return; }
+    if (!password) { _showFieldErr('password', 'Введіть пароль'); return; }
+
+    const result = await AuthService.login(email, password);
+
+    if (result.success) {
+      _onLoginSuccess(result.user);
+    } else if (result.needVerification) {
+      _pendingEmail = result.email;
+      if (AuthService.isSupabaseMode()) {
+        // Supabase: повторно надсилаємо код та показуємо форму введення
+        await AuthService.resendOTP(email);
+        _mode = 'verify';
+        document.getElementById('auth-form-container').innerHTML = _renderVerifyForm();
+        _bindEvents();
+      } else {
+        // Sandbox: показуємо форму введення OTP коду
+        await AuthService.resendOTP(email);
+        _mode = 'verify';
+        document.getElementById('auth-form-container').innerHTML = _renderVerifyForm();
+        _bindEvents();
+      }
+    } else {
+      globalErr.textContent = result.error;
+      globalErr.classList.remove('hidden');
+    }
+  }
+
+  async function _doRegister(form) {
+    const email = form.email?.value?.trim() || '';
+    const password = form.password?.value || '';
+    const passwordConfirm = form.passwordConfirm?.value || '';
+    const displayName = form.displayName?.value?.trim() || '';
+    const globalErr = document.getElementById('auth-global-err');
+
+    if (!email) { _showFieldErr('email', 'Введіть email'); return; }
+    if (!password) { _showFieldErr('password', 'Введіть пароль'); return; }
+    if (password !== passwordConfirm) { _showFieldErr('passwordConfirm', 'Паролі не збігаються'); return; }
+
+    // Перевірка згоди з правилами
+    const consentCb = document.getElementById('consent-cb');
+    if (!consentCb || !consentCb.checked) {
+      _showFieldErr('consent', 'Потрібна ваша згода для реєстрації');
+      return;
+    }
+
+    const result = await AuthService.startRegistration(email, password, displayName);
+
+    if (result.success) {
+      _pendingEmail = result.email || email;
+      _mode = 'verify';
+      document.getElementById('auth-form-container').innerHTML = _renderVerifyForm();
+      _bindEvents();
+    } else {
+      if (result.alreadyRegistered) {
+        globalErr.textContent = result.error;
+        globalErr.classList.remove('hidden');
+      } else if (result.error?.toLowerCase().includes('email')) {
+        _showFieldErr('email', result.error);
+      } else if (result.error?.toLowerCase().includes('пароль')) {
+        _showFieldErr('password', result.error);
+      } else {
+        globalErr.textContent = result.error;
+        globalErr.classList.remove('hidden');
+      }
+    }
+  }
+
+  async function _doVerify(form) {
+    const otp = form.otp?.value?.replace(/\s/g, '') || '';
+
+    if (!otp || otp.length !== 5) { _showFieldErr('otp', 'Введіть 5-значний код з пошти'); return; }
+
+    const result = await AuthService.verifyCodeAndRegister(otp);
+
+    if (result.success) {
+      _clearTimers();
+      document.getElementById('auth-form-container').innerHTML = `
+        <div class="text-center py-6">
+          <div class="text-5xl mb-3">🎉</div>
+          <h2 class="text-lg font-bold text-green-700 dark:text-green-400">Email підтверджено!</h2>
+          <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">Ваш акаунт активовано. Нараховано <strong>+500 Короликів 👑</strong></p>
+          <p class="text-sm text-gray-400 mt-1">Перенаправлення...</p>
+        </div>
+      `;
+
+      const user = result.user || AuthService.getCurrentUser();
+      if (user) {
+        // Показуємо кнопку підключення Telegram перед переходом у кабінет
+        document.getElementById('auth-form-container').innerHTML = `
+          <div class="text-center py-4">
+            <div class="text-5xl mb-3">🎉</div>
+            <h2 class="text-lg font-bold text-green-700 dark:text-green-400">Email підтверджено!</h2>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">Ваш акаунт активовано. Нараховано <strong>+500 Короликів 👑</strong></p>
+          </div>
+          <div class="mt-4 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-2xl border border-blue-200 dark:border-blue-800 text-center space-y-3">
+            <p class="text-sm font-semibold text-blue-700 dark:text-blue-300">📲 Підключіть Telegram-сповіщення</p>
+            <p class="text-xs text-blue-600 dark:text-blue-400">Отримуйте сповіщення про поповнення балансу та важливі події прямо в Telegram.</p>
+            <a href="https://t.me/mICaB_Bot?start=${user.id}" target="_blank" rel="noopener"
+              class="btn-primary w-full justify-center bg-blue-500 hover:bg-blue-600 inline-flex">
+              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
+              Підключити @mICaB_Bot
+            </a>
+            <button id="skip-telegram-btn" class="text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 w-full">Пропустити, зайти в кабінет →</button>
+          </div>
+        `;
+        // Прив'язуємо кнопку «Пропустити»
+        document.getElementById('skip-telegram-btn').addEventListener('click', () => {
+          _onLoginSuccess(user);
+        });
+        // Автоматичний перехід через 15 сек якщо не натиснули нічого
+        setTimeout(() => {
+          if (document.getElementById('skip-telegram-btn')) _onLoginSuccess(user);
+        }, 15000);
+      } else {
+        setTimeout(() => {
+          _mode = 'login';
+          document.getElementById('auth-form-container').innerHTML = _renderLoginForm();
+          _bindEvents();
+          const ge = document.getElementById('auth-global-err');
+          if (ge) { ge.textContent = '✅ Акаунт створено. Увійдіть.'; ge.classList.remove('hidden', 'text-red-500'); ge.classList.add('text-green-600'); }
+        }, 2000);
+      }
+    } else {
+      _showFieldErr('otp', result.error);
+    }
+  }
+
+  function _onLoginSuccess(user) {
+    _clearTimers();
+    // Оновлюємо ім'я в localStorage для шаблонів
+    if (user.displayName) {
+      localStorage.setItem('saas_user_name', user.displayName);
+    }
+    // Щоденний бонус
+    KorolikyService.checkAndClaimDailyBonus();
+    unmount();
+    // Ре-рендер UI
+    Router.navigate('dashboard');
+    Topbar.render();
+    Notifications.add(`👋 Вітаємо, ${user.displayName}!`);
+
+    // Бонус при вході
+    EventBus.on('koroliky:bonus_claimed', ({ amount }) => {
+      Notifications.add(`👑 +${amount} Короликів нараховано за вхід сьогодні!`);
+    }, { once: true });
+  }
+
+  // ─── OTP таймери ─────────────────────────────────────────────────────────
+
+  function _startOTPTimers() {
+    _clearTimers();
+
+    // Таймер закінчення дії коду
+    _otpTimerInterval = setInterval(() => {
+      const status = AuthService.getOTPStatus(_pendingEmail);
+      const expiresEl = document.getElementById('otp-expires');
+      if (expiresEl) {
+        if (status.secondsLeft > 0) {
+          const m = Math.floor(status.secondsLeft / 60);
+          const s = status.secondsLeft % 60;
+          expiresEl.textContent = `Код дійсний ще: ${m}:${String(s).padStart(2,'0')}`;
+        } else {
+          expiresEl.textContent = '⚠️ Код застарів — запросіть новий';
         }
-        if (error.message?.includes('Invalid login credentials')) {
-          return { success: false, error: 'Невірний email або пароль' };
-        }
-        return { success: false, error: error.message };
       }
+    }, 1000);
 
-      const sbUser = data.user;
+    // Таймер resend
+    let resendLeft = AuthService.getOTPStatus(_pendingEmail).resendIn || 60;
+    const resendBtn = document.getElementById('resend-otp-btn');
+    const countdown = document.getElementById('resend-countdown');
 
-      // Не пускаємо в кабінет, доки пошта не підтверджена
-      if (!sbUser.email_confirmed_at) {
-        return { success: false, needVerification: true, email, error: 'Підтвердіть email перед входом' };
+    _resendTimerInterval = setInterval(() => {
+      resendLeft = Math.max(0, resendLeft - 1);
+      if (countdown) countdown.textContent = resendLeft;
+      if (resendLeft === 0) {
+        if (resendBtn) { resendBtn.disabled = false; resendBtn.innerHTML = 'Відправити повторно'; }
+        clearInterval(_resendTimerInterval);
       }
+    }, 1000);
+  }
 
-      const displayName = sbUser.user_metadata?.full_name || sbUser.user_metadata?.display_name || email.split('@')[0];
-      await _ensureLocalProfile(email, displayName, sbUser.id);
-      await _activateLocalProfile(email, sbUser.id);
+  function _clearTimers() {
+    if (_otpTimerInterval) { clearInterval(_otpTimerInterval); _otpTimerInterval = null; }
+    if (_resendTimerInterval) { clearInterval(_resendTimerInterval); _resendTimerInterval = null; }
+  }
 
-      const localUser = _findUserByEmail(email);
-      _startSession(localUser || { id: sbUser.id, email, displayName });
+  function _showFieldErr(field, msg) {
+    const el = document.getElementById(`err-${field}`);
+    if (el) { el.textContent = msg; el.classList.remove('hidden'); }
+  }
 
-      // Синхронізуємо баланс Короликів з таблицею profiles у Supabase
-      if (typeof KorolikyService !== 'undefined' && KorolikyService.syncFromSupabase) {
-        await KorolikyService.syncFromSupabase();
-      }
+  // ─── Перевірка при старті застосунку ─────────────────────────────────────
 
-      return { success: true, user: _publicUser(localUser || { id: sbUser.id, email, displayName, status: 'active', koroliky: 0 }) };
+  /**
+   * Якщо користувач не авторизований — показує сторінку входу.
+   * Викликається з app.js перед ініціалізацією Router.
+   */
+  function checkAuth() {
+    if (!AuthService.isLoggedIn()) {
+      mount('login');
+      return false;
+    }
+    // Спочатку синхронізуємо баланс з Supabase, потім перевіряємо щоденний бонус
+    if (typeof KorolikyService !== 'undefined' && KorolikyService.syncFromSupabase) {
+      KorolikyService.syncFromSupabase().then(() => _claimDailyBonusIfAvailable());
+    } else {
+      _claimDailyBonusIfAvailable();
+    }
+    return true;
+  }
 
-    } catch (e) {
-      return { success: false, error: e.message };
+  function _claimDailyBonusIfAvailable() {
+    const bonusResult = KorolikyService.checkAndClaimDailyBonus();
+    if (bonusResult.claimed) {
+      setTimeout(() => {
+        Notifications.add(`👑 +${bonusResult.amount} Короликів — щоденний бонус нараховано!`);
+        EventBus.emit('koroliky:changed', {});
+      }, 1000);
     }
   }
 
-  async function _sandboxLogin(email, password) {
-    const user = _findUserByEmail(email);
-    if (!user) return { success: false, error: 'Невірний email або пароль' };
-
-    const passwordOk = await _verifyPassword(password, user.passwordHash, user.passwordSalt);
-    if (!passwordOk) return { success: false, error: 'Невірний email або пароль' };
-
-    if (user.status === 'unverified') {
-      return { success: false, needVerification: true, email, error: 'Підтвердіть email перед входом' };
-    }
-    if (user.status === 'suspended') {
-      return { success: false, error: 'Акаунт заблоковано. Зверніться до підтримки.' };
-    }
-
-    _startSession(user);
-    return { success: true, user: _publicUser(user) };
-  }
-
-  // ════════════════════════════════════════════════════════════════════════
-  // СЕСІЯ
-  // ════════════════════════════════════════════════════════════════════════
-
-  function _startSession(user) {
-    localStorage.setItem(SESSION_KEY, JSON.stringify({
-      userId: user.id,
-      email: user.email,
-      displayName: user.displayName,
-      startedAt: new Date().toISOString(),
-    }));
-  }
-
-  function logout() {
-    // Supabase logout
-    const sb = _getSupabaseClient();
-    if (sb) sb.auth.signOut().catch(() => {});
-    localStorage.removeItem(SESSION_KEY);
-    EventBus.emit('auth:logout');
-  }
-
-  function getSession() {
-    try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); }
-    catch { return null; }
-  }
-
-  function isLoggedIn() {
-    return getSession() !== null;
-  }
-
-  function getCurrentUser() {
-    const session = getSession();
-    if (!session) return null;
-    const user = _findUserByEmail(session.email);
-    return user ? _publicUser(user) : null;
-  }
-
-  function _publicUser(user) {
-    return {
-      id: user.id,
-      email: user.email,
-      displayName: user.displayName,
-      status: user.status,
-      koroliky: user.koroliky || 0,
-      lastBonusClaimedAt: user.lastBonusClaimedAt,
-      createdAt: user.createdAt,
-      verifiedAt: user.verifiedAt,
-    };
-  }
-
-  function updateUser(userId, patch) {
-    const users = _getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx === -1) return null;
-    users[idx] = { ...users[idx], ...patch, updatedAt: new Date().toISOString() };
-    _saveUsers(users);
-    return _publicUser(users[idx]);
-  }
-
-  function getUserById(id) {
-    const user = _getUsers().find(u => u.id === id);
-    return user ? _publicUser(user) : null;
-  }
-
-  function getOTPStatus(email) {
-    // У Supabase-режимі нема локального OTP — показуємо лише що лист відправлено
-    if (_isSupabaseMode()) {
-      return { exists: true, secondsLeft: 600, resendIn: 60, expired: false, sandbox: false };
-    }
-    const data = JSON.parse(localStorage.getItem(OTP_KEY + '_' + email) || 'null');
-    if (!data) return { exists: false };
-    const secondsLeft = Math.max(0, Math.ceil((data.expiresAt - Date.now()) / 1000));
-    const resendIn = Math.max(0, Math.ceil(60 - (Date.now() - data.sentAt) / 1000));
-    return { exists: true, secondsLeft, resendIn, expired: secondsLeft === 0, sandbox: true };
-  }
-
-  return {
-    register,
-    startRegistration,
-    verifyCodeAndRegister,
-    resendRegistrationCode,
-    login,
-    logout,
-    verifyOTP,
-    resendOTP,
-    getSession,
-    isLoggedIn,
-    getCurrentUser,
-    updateUser,
-    getUserById,
-    validateEmail,
-    getOTPStatus,
-    isSupabaseMode: _isSupabaseMode,
-  };
+  return { mount, unmount, checkAuth };
 })();
